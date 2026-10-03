@@ -1,0 +1,101 @@
+name: Build Spotify-package APK
+
+# Fork-only. ColorOS 15 shows Live Alerts only for allowlisted packages, so
+# this rebuilds every upstream release as com.spotify.music and publishes it
+# on this repo. The in-app updater is repointed here, so the renamed build
+# keeps updating itself instead of offering upstream's com.metrolist.music APK.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}
+
+env:
+  UPSTREAM: MetrolistGroup/Metrolist
+  APPLICATION_ID: com.spotify.music
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  check:
+    if: github.repository != 'MetrolistGroup/Metrolist'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.upstream.outputs.tag }}
+    steps:
+      - name: Find an upstream release not rebuilt here yet
+        id: upstream
+        run: |
+          TAG=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "$TAG is already published here"
+          else
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.tag != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ env.TAG }}
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          java-version: "21"
+          distribution: "temurin"
+
+      - name: Set Up Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      # The greps fail the build if upstream moves these lines, instead of
+      # silently shipping an APK that updates itself back to the real package.
+      - name: Point updater and shortcuts at this build
+        run: |
+          UPDATER=app/src/main/kotlin/com/metrolist/music/utils/Updater.kt
+          SHORTCUTS=app/src/main/res/xml/shortcuts.xml
+          sed -i "s|repos/$UPSTREAM\"|repos/$GITHUB_REPOSITORY\"|" "$UPDATER"
+          sed -i "s|targetPackage=\"com.metrolist.music\"|targetPackage=\"$APPLICATION_ID\"|" "$SHORTCUTS"
+          grep -q "repos/$GITHUB_REPOSITORY\"" "$UPDATER"
+          grep -q "targetPackage=\"$APPLICATION_ID\"" "$SHORTCUTS"
+
+      - name: Build Release APK
+        run: chmod +x gradlew && ./gradlew --console=plain assembleFossRelease --warning-mode summary
+        env:
+          METROLIST_APPLICATION_ID: ${{ env.APPLICATION_ID }}
+          METROLIST_APP_NAME: Metrolist
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+          LASTFM_SECRET: ${{ secrets.LASTFM_SECRET }}
+
+      - name: Sign APK
+        uses: ilharp/sign-android-release@v2.0.0
+        with:
+          releaseDir: app/build/outputs/apk/foss/release/
+          signingKey: ${{ secrets.KEYSTORE }}
+          keyAlias: ${{ secrets.KEY_ALIAS }}
+          keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+          buildToolsVersion: 36.0.0
+
+      # Metrolist.apk is the asset name the FOSS updater looks for.
+      - name: Publish release
+        run: |
+          mv app/build/outputs/apk/foss/release/*-signed.apk Metrolist.apk
+          gh release view "$TAG" --repo "$UPSTREAM" --json body --jq .body > notes.md
+          gh release create "$TAG" Metrolist.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG ($APPLICATION_ID)" \
+            --notes-file notes.md \
+            --latest

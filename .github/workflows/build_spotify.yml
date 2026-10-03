@@ -93,9 +93,8 @@ jobs:
       - name: Publish release
         run: |
           mv app/build/outputs/apk/foss/release/*-signed.apk Metrolist.apk
-          gh release view "$TAG" --repo "$UPSTREAM" --json body --jq .body > notes.md
           gh release create "$TAG" Metrolist.apk \
             --repo "$GITHUB_REPOSITORY" \
             --title "$TAG ($APPLICATION_ID)" \
-            --notes-file notes.md \
+            --notes "Upstream $TAG rebuilt as $APPLICATION_ID." \
             --latest
